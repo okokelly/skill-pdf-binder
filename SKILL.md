@@ -1,13 +1,23 @@
 ---
 name: pdf-binder
 description: Build a formatted PDF binder from multiple web articles and/or PDFs — readability extraction, TOC with page numbers, footers, bookmarks, and clickable TOC links. Includes pre-send quality checklist.
-version: 1.0.0
+version: 1.1.0
 category: productivity
 ---
 
 # PDF Binder Builder
 
-Build a polished PDF binder from a list of source URLs (HTML articles or PDFs). Uses Mozilla's Readability to strip nav/banners/ads, Playwright for proper rendering, reportlab for page number stamping, and PyPDF2 for merging + annotations.
+Build a polished PDF binder from a list of source URLs (HTML articles or PDFs). Uses Mozilla's Readability to strip nav/banners/ads, Playwright for proper rendering, reportlab for page number stamping, and pypdf (PyPDF2 fallback) for merging + annotations.
+
+## Quick path
+
+`scripts/rebuild.py` implements this entire pipeline. Drive it with a JSON manifest:
+
+```bash
+python3 scripts/rebuild.py ARTICLES_DIR output.pdf < manifest.json
+```
+
+The step-by-step below documents what the script does (and how to do it by hand).
 
 ## When to use
 
@@ -45,6 +55,8 @@ clean_html = doc.summary()
 # CRITICAL: Fix relative image URLs using the ARTICLE URL as base (not domain root!)
 # e.g. urljoin("https://site.com/posts/article/", "image.png") → correct
 # NOT urljoin("https://site.com", "image.png") → 404
+# fix_image_urls must also rewrite srcset, single-quoted src, and protocol-
+# relative (//) URLs — not just double-quoted src="" attributes.
 clean_html = fix_image_urls(clean_html, article_url)
 ```
 
@@ -96,28 +108,38 @@ TOC format:
 
 ### 7. Add PDF bookmarks and clickable TOC links
 
-**Preferred approach: Native browser anchor links.** Render TOC + all HTML articles as ONE combined HTML. Use `<a href="#article-id">` in the TOC — Playwright's PDF output preserves these as native PDF internal links. This is truly "bound to text" — the browser engine calculates exact text bounding boxes, immune to zoom/reflow/layout shifts.
+**Bookmarks:** `writer.add_outline_item(title, page_index, parent=None)` — one per article, plus a "Contents" entry pointing at the TOC page. These are robust and the primary navigation.
 
-**For PDF sources inserted between HTML articles:** The insertion shifts page offsets, breaking native links for articles AFTER the insertion point. For these (typically only 2-3), use PyPDF2 Link annotations as fallback.
-
-**Bookmarks:** `writer.add_outline_item(title, page_index, parent=None)`
-
-**Fallback — PyPDF2 Link annotations for shifted entries:**
+**Clickable TOC links — measure rects, don't estimate them.** Rendering each article individually (so PDFs splice in at exact positions) means native `<a href="#…">` anchors can't span documents, so the TOC links are PDF `/Link` annotations. The reliable way to place them is to **measure the rendered TOC**: have Playwright return each entry's bounding box, then convert CSS px → PDF points.
 
 ```python
-annotation = DictionaryObject()
-annotation[NameObject("/Subtype")] = NameObject("/Link")
-annotation[NameObject("/Rect")] = rect
-action = DictionaryObject()
-action[NameObject("/S")] = NameObject("/GoTo")
-action[NameObject("/D")] = ArrayObject([FloatObject(page_idx), NameObject("/XYZ"), ...])
-annotation[NameObject("/A")] = action
-toc_page["/Annots"].append(annotation)
+# After rendering the TOC, measure each row in the SAME pass:
+rects = page.eval_on_selector_all(
+    ".toc-link",
+    "els => els.map(e => { const r = e.getBoundingClientRect();"
+    " return {top:r.top, left:r.left, width:r.width, height:r.height}; })",
+)
+# Render with print media + an A4-width viewport so layout == the PDF.
+# Convert: pt = px * 72/96; PDF y is from the page bottom.
 ```
 
-Estimate TOC entry y-positions based on CSS margins + font sizes:
-- TOC heading bottom: margin_top + 18 + 8 + 18 ≈ 101pt
-- Each entry: ~34pt (11pt title + 9pt author + 14pt margin-bottom)
+This survives title wrapping and layout shifts — the older "estimate y from font sizes (~34pt/entry)" heuristic breaks the moment any title wraps to a second line. Avoid it.
+
+Build the annotation with a `/Dest` pointing at the target page (no `/A` action needed):
+
+```python
+link = DictionaryObject()
+link[NameObject("/Subtype")] = NameObject("/Link")
+link[NameObject("/Rect")]    = RectangleObject([x0, y0, x1, y1])
+link[NameObject("/Border")]  = ArrayObject([NumberObject(0)] * 3)  # no visible box
+link[NameObject("/Dest")]    = ArrayObject([
+    writer.pages[target_idx].indirect_reference,
+    NameObject("/XYZ"), NumberObject(0), NumberObject(int(A4_H)), NumberObject(0),
+])
+toc_page[NameObject("/Annots")] = ArrayObject([link])  # or append if it exists
+```
+
+**Note:** if the TOC rows are `<a href="#">` elements, Playwright emits its own dead link annotations for them — use plain `<div>` rows so the only links are the measured ones you add.
 
 ## Pre-Send Quality Checklist
 
@@ -138,8 +160,8 @@ Before uploading and sending, run this loop:
        Open in any PDF viewer sidebar → check outline panel.
 
 □ 5. TOC LINKS: Click each TOC entry → jumps to correct article start page?
-       Prefer native HTML anchors (render TOC+articles as one HTML).
-       Only use annotation fallback for links broken by PDF insertions.
+       Links are /Link annotations placed from measured TOC rects.
+       Verify count == #articles (no stray dead links from <a href="#"> rows).
 
 □ 6. CLEAN CONTENT: No nav bars, sharing icons, "Related Articles" banners?
        Readability should handle this. Spot-check first and last page of each article.
@@ -158,15 +180,17 @@ Before uploading and sending, run this loop:
 ## Dependencies
 
 ```bash
-pip3 install readability-lxml playwright reportlab PyPDF2
+pip3 install readability-lxml lxml_html_clean playwright reportlab pypdf
 python3 -m playwright install chromium
 ```
 
+(`pypdf` is the maintained successor to `PyPDF2`; the script accepts either.)
+
 ## Pitfalls
 
-- **Image 404s:** `urljoin(base_url, img_src)` — use article URL as base, NOT domain root. A relative `src="image.png"` on `site.com/posts/article/` resolves differently than on `site.com/`.
+- **Image 404s:** `urljoin(base_url, img_src)` — use article URL as base, NOT domain root. A relative `src="image.png"` on `site.com/posts/article/` resolves differently than on `site.com/`. Rewrite `srcset` and single-quoted `src` too, or responsive images silently 404.
 - **Readability stripping too much:** Some sites (paywalled, Substack) may return minimal content. Fall back to browser-based extraction if readability output < 500 chars.
 - **Playwright timeout on heavy pages:** Some pages have endless JS. Cap at 30s, use `wait_until="networkidle"`.
 - **Page number drift:** If merging order changes, TOC page numbers must be recalculated. Always rebuild TOC after final merge.
 - **PDF source positioning:** When inserting a PDF between HTML-rendered articles, render articles individually (not as one combined HTML) so insertion point is exact.
-- **Reportlab Unicode:** Core PDF fonts only support Latin-1. Use `safe_text()` to replace Unicode chars before stamping — or the stamp itself will crash.
+- **Reportlab Unicode:** Core PDF fonts (Helvetica) only support Latin-1, so a non-Latin header (CJK, Greek, math) becomes `???`. Proper fix: register a TrueType Unicode font — `pdfmetrics.registerFont(TTFont("Uni", "<path>/DejaVuSans.ttf"))` — and stamp with it. Keep `safe_text()` only as the fallback for when no such font is found.

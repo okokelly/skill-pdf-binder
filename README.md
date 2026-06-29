@@ -96,6 +96,28 @@ articles + a spliced multi-page PDF). Highlights:
 | `scripts/rebuild.py` | Standalone CLI — runs the full pipeline from a JSON manifest |
 | `templates/article.html` | HTML template for rendering a single article |
 
+## Future roadmap
+
+The deterministic pipeline (extract → render → merge → stamp → TOC → links) needs
+no LLM — it's pure Python and is more reliable run as a plain tool. An agent only
+earns its place at two fuzzy edges, and the roadmap is about sharpening that split:
+
+- **`--verify` mode** — move the mechanical pre-send checks (image links resolve,
+  page numbers match starts, footers present, bookmark/link counts, file size)
+  out of the prose checklist and into hard assertions the script runs itself. These
+  don't need a model; they should fail loudly in CI, not rely on a human eyeballing.
+- **`build-manifest` helper** — turn an unstructured request ("bind these five
+  links") into a clean `manifest.json`: infer title/author/type, dedupe, and order
+  the sources. This *is* the natural-language → structured-input step where an LLM
+  genuinely helps.
+- **Semantic QA (multimodal, optional)** — keep the model only for the judgment
+  checks that resist automation: "did Readability strip the body to plain text?"
+  and "are there leftover nav bars / Related-Articles banners?" — i.e. *does the
+  rendered page look like a clean article?*
+
+Net effect: the LLM's role shrinks to manifest-building and the handful of QA items
+that truly need a brain; everything else becomes deterministic and testable.
+
 ## License
 
 MIT
